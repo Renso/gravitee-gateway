@@ -15,16 +15,21 @@
  */
 package io.gravitee.gateway.services.healthcheck.http;
 
+import io.gravitee.alert.api.event.Event;
 import io.gravitee.common.http.HttpHeaders;
 import io.gravitee.common.http.HttpStatusCode;
+import io.gravitee.common.utils.UUID;
 import io.gravitee.definition.model.HttpClientSslOptions;
 import io.gravitee.definition.model.HttpProxy;
 import io.gravitee.definition.model.endpoint.HttpEndpoint;
+import io.gravitee.gateway.env.GatewayConfiguration;
 import io.gravitee.gateway.services.healthcheck.EndpointRule;
 import io.gravitee.gateway.services.healthcheck.EndpointStatusDecorator;
 import io.gravitee.gateway.services.healthcheck.eval.EvaluationException;
 import io.gravitee.gateway.services.healthcheck.eval.assertion.AssertionEvaluation;
 import io.gravitee.gateway.services.healthcheck.http.el.EvaluableHttpResponse;
+import io.gravitee.node.api.Node;
+import io.gravitee.plugin.alert.AlertService;
 import io.gravitee.reporter.api.common.Request;
 import io.gravitee.reporter.api.common.Response;
 import io.gravitee.reporter.api.health.EndpointStatus;
@@ -42,11 +47,15 @@ import io.vertx.core.net.ProxyType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.regex.Pattern;
+
+import static java.lang.System.currentTimeMillis;
 
 /**
  * @author David BRASSELY (david.brassely at graviteesource.com)
@@ -59,16 +68,17 @@ public class HttpEndpointRuleHandler implements Handler<Long> {
 
     // Pattern reuse for duplicate slash removal
     private static final Pattern DUPLICATE_SLASH_REMOVER = Pattern.compile("(?<!(http:|https:))[//]+");
-
     private static final String HTTPS_SCHEME = "https";
 
     private final EndpointRule rule;
-
     private final Vertx vertx;
-
     private final EndpointStatusDecorator endpointStatus;
-
     private Handler<EndpointStatus> statusHandler;
+
+    private AlertService alertService;
+    private GatewayConfiguration gatewayConfiguration;
+    private Node node;
+    private String port;
 
     public HttpEndpointRuleHandler(Vertx vertx, EndpointRule rule) {
         this.vertx = vertx;
@@ -209,16 +219,16 @@ public class HttpEndpointRuleHandler implements Handler<Long> {
 
                 final EndpointStatus.Builder healthBuilder = EndpointStatus
                         .forEndpoint(rule.api(), endpoint.getName())
-                        .on(System.currentTimeMillis());
+                        .on(currentTimeMillis());
 
-                long startTime = System.currentTimeMillis();
+                long startTime = currentTimeMillis();
 
                 Request request = new Request();
                 request.setMethod(step.getRequest().getMethod());
                 request.setUri(hcRequestUri.toString());
 
                 healthRequest.handler(response -> response.bodyHandler(buffer -> {
-                    long endTime = System.currentTimeMillis();
+                    long endTime = currentTimeMillis();
                     logger.debug("Health-check endpoint returns a response with a {} status code", response.statusCode());
 
                     String body = buffer.toString();
@@ -262,7 +272,7 @@ public class HttpEndpointRuleHandler implements Handler<Long> {
                 }));
 
                 healthRequest.exceptionHandler(event -> {
-                    long endTime = System.currentTimeMillis();
+                    long endTime = currentTimeMillis();
 
                     EndpointStatus.StepBuilder stepBuilder = EndpointStatus.forStep(step.getName());
                     stepBuilder.fail(event.getMessage());
@@ -318,16 +328,61 @@ public class HttpEndpointRuleHandler implements Handler<Long> {
 
     private void report(final EndpointStatus endpointStatus) {
         final int previousStatusCode = rule.endpoint().getStatus().code();
+        final String previousStatusName = rule.endpoint().getStatus().name();
         this.endpointStatus.updateStatus(endpointStatus.isSuccess());
         endpointStatus.setState(rule.endpoint().getStatus().code());
         endpointStatus.setAvailable(!rule.endpoint().getStatus().isDown());
         endpointStatus.setResponseTime((long) endpointStatus.getSteps().stream().mapToLong(Step::getResponseTime).average().getAsDouble());
-        endpointStatus.setTransition(previousStatusCode != rule.endpoint().getStatus().code());
+        final boolean transition = previousStatusCode != rule.endpoint().getStatus().code();
+        endpointStatus.setTransition(transition);
+
+        if (transition && alertService != null) {
+            String hostName = "unknown";
+            String ip = "unknown";
+            try {
+                hostName = InetAddress.getLocalHost().getHostName();
+                ip = InetAddress.getLocalHost().getHostAddress();
+            } catch (final UnknownHostException uhe) {
+                logger.warn("Could not get hostname", uhe);
+            }
+            final Event.Builder props = new Event.Builder()
+                    .id(UUID.toString(UUID.random()))
+                    .timestamp(currentTimeMillis())
+                    .context("Gateway", node.id())
+                    .context("Hostname", hostName)
+                    .context("IP", ip)
+                    .context("Port", port)
+                    .type("HC")
+                    .prop("API", endpointStatus.getApi())
+                    .prop("Endpoint", endpointStatus.getEndpoint())
+                    .prop("Old status", previousStatusName)
+                    .prop("New status", rule.endpoint().getStatus().name());
+            if (gatewayConfiguration.tenant().isPresent()) {
+                props.context("tenant", gatewayConfiguration.tenant().get());
+            }
+            alertService.send(props.build());
+        }
 
         statusHandler.handle(endpointStatus);
     }
 
     public void setStatusHandler(Handler<EndpointStatus> statusHandler) {
         this.statusHandler = statusHandler;
+    }
+
+    public void setAlertService(AlertService alertService) {
+        this.alertService = alertService;
+    }
+
+    public void setGatewayConfiguration(GatewayConfiguration gatewayConfiguration) {
+        this.gatewayConfiguration = gatewayConfiguration;
+    }
+
+    public void setNode(Node node) {
+        this.node = node;
+    }
+
+    public void setPort(String port) {
+        this.port = port;
     }
 }
